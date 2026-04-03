@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Data & model weights
+data/
+model/
+exp_results/
+lightning_logs/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Polyscope / ImGui state
+.polyscope.ini
+imgui.ini
+applications/.polyscope.ini
+applications/imgui.ini
+
+# OS
+.DS_Store
+Thumbs.db

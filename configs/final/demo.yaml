@@ -16,7 +16,8 @@ dataset:
   data_path: "objaverse_data"
   train_batch_size: 1
   val_batch_size: 1
-  train_num_workers: 8
+  train_num_workers: 4
+  val_num_workers: 0
 
 loss:
   triplet: 1.0

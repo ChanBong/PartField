@@ -640,6 +640,215 @@ def feature_distance_pt(feats, query_feat):
     return (1. - torch.nn.functional.cosine_similarity(feats, query_feat[None,:], dim=-1)) / 2.
 
 
+# Distinct cluster colors (categorical, not a gradient)
+CLUSTER_COLORS = np.array([
+    [0.90, 0.20, 0.20],  # red
+    [0.20, 0.60, 0.90],  # blue
+    [0.20, 0.80, 0.30],  # green
+    [0.95, 0.60, 0.10],  # orange
+    [0.70, 0.30, 0.85],  # purple
+    [0.95, 0.85, 0.10],  # yellow
+    [0.10, 0.80, 0.80],  # cyan
+    [0.90, 0.40, 0.70],  # pink
+    [0.55, 0.35, 0.15],  # brown
+    [0.40, 0.75, 0.55],  # teal
+    [0.85, 0.50, 0.25],  # burnt orange
+    [0.50, 0.50, 0.90],  # periwinkle
+    [0.75, 0.85, 0.20],  # lime
+    [0.90, 0.30, 0.50],  # rose
+    [0.30, 0.50, 0.70],  # steel blue
+    [0.80, 0.65, 0.40],  # tan
+    [0.55, 0.80, 0.80],  # light teal
+    [0.75, 0.40, 0.55],  # mauve
+    [0.45, 0.70, 0.30],  # olive green
+    [0.85, 0.75, 0.60],  # wheat
+    [0.60, 0.40, 0.70],  # medium purple
+    [0.30, 0.70, 0.60],  # sea green
+    [0.90, 0.55, 0.55],  # salmon
+    [0.40, 0.40, 0.60],  # slate
+    [0.70, 0.70, 0.20],  # olive
+    [0.20, 0.50, 0.50],  # dark teal
+    [0.80, 0.30, 0.30],  # dark red
+    [0.30, 0.30, 0.80],  # dark blue
+    [0.50, 0.80, 0.50],  # light green
+    [0.80, 0.50, 0.80],  # light purple
+], dtype=np.float32)
+
+DIMMED_COLOR = np.array([0.92, 0.92, 0.92], dtype=np.float32)
+
+
+def _build_brep_adjacency(vertices, faces, face_map):
+    """Build B-Rep face adjacency from shared boundary vertices.
+
+    B-Rep faces are tessellated independently so their triangles don't share
+    mesh edges.  Instead, adjacent B-Rep faces have coincident vertices along
+    their shared boundary.  We detect these by spatial hashing.
+    """
+    # For each B-Rep face, collect its vertex positions
+    brep_face_verts = defaultdict(set)  # brep_fid -> set of vertex indices
+    for tri_idx, brep_fid in enumerate(face_map):
+        for vid in faces[tri_idx]:
+            brep_face_verts[int(brep_fid)].add(int(vid))
+
+    # Spatial hash: round coords to detect coincident vertices across faces
+    # Resolution: 1e-4 (0.1mm for typical CAD tolerances)
+    RESOLUTION = 1e4
+    pos_to_faces = defaultdict(set)
+    for brep_fid, vids in brep_face_verts.items():
+        for vid in vids:
+            v = vertices[vid]
+            key = (round(v[0] * RESOLUTION),
+                   round(v[1] * RESOLUTION),
+                   round(v[2] * RESOLUTION))
+            pos_to_faces[key].add(brep_fid)
+
+    # Two B-Rep faces are adjacent if they share any coincident vertex position
+    adjacency = defaultdict(set)
+    for key, fids in pos_to_faces.items():
+        fids = list(fids)
+        for i in range(len(fids)):
+            for j in range(i + 1, len(fids)):
+                adjacency[fids[i]].add(fids[j])
+                adjacency[fids[j]].add(fids[i])
+
+    return adjacency
+
+
+def _find_brep_connected_components(brep_fids, adjacency):
+    """Find connected components among a set of B-Rep face IDs."""
+    fid_set = set(brep_fids)
+    visited = set()
+    components = []
+
+    for start in brep_fids:
+        if start in visited:
+            continue
+        comp = []
+        queue = [start]
+        while queue:
+            node = queue.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            comp.append(node)
+            for nb in adjacency.get(node, set()):
+                if nb in fid_set and nb not in visited:
+                    queue.append(nb)
+        components.append(sorted(comp))
+
+    components.sort(key=len, reverse=True)
+    return components
+
+
+def _compute_sub_cohesion(tri_indices, point_feat_normed, face_map):
+    """Compute cohesion and B-Rep faces for a set of triangles."""
+    feats = point_feat_normed[tri_indices]
+    centroid = feats.mean(axis=0)
+    norm = np.linalg.norm(centroid)
+    if norm > 0:
+        centroid = centroid / norm
+    cohesion = float((feats @ centroid).mean())
+
+    n_brep = 0
+    brep_fids = []
+    if face_map is not None:
+        brep_fids = np.unique(face_map[tri_indices]).tolist()
+        n_brep = len(brep_fids)
+
+    return cohesion, n_brep, brep_fids
+
+
+def _on_cluster_computed(m, point_feat_normed):
+    """Build hierarchical cluster groups: clusters -> sub-features (connected B-Rep regions)."""
+    labels = m['cluster_labels']
+    m['point_feat_normed'] = point_feat_normed
+    face_map = m.get('face_map', None)
+    n_clusters = int(labels.max()) + 1
+
+    # Build B-Rep face adjacency (shared boundary vertices)
+    brep_adj = None
+    if face_map is not None:
+        brep_adj = _build_brep_adjacency(m['V'], m['F'], face_map)
+
+    groups = []
+    for cid in range(n_clusters):
+        tri_indices = np.where(labels == cid)[0]
+        if len(tri_indices) == 0:
+            continue
+
+        cluster_coh, cluster_n_brep, _ = _compute_sub_cohesion(
+            tri_indices, point_feat_normed, face_map)
+
+        subs = []
+
+        if face_map is not None and brep_adj is not None:
+            # Split by B-Rep face connectivity
+            brep_fids = np.unique(face_map[tri_indices]).tolist()
+            components = _find_brep_connected_components(brep_fids, brep_adj)
+
+            for comp_fids in components:
+                # Get all triangles belonging to these B-Rep faces
+                comp_tris = np.where(np.isin(face_map, comp_fids) & (labels == cid))[0]
+                coh, n_brep, bf = _compute_sub_cohesion(
+                    comp_tris, point_feat_normed, face_map)
+                subs.append({
+                    'tri_indices': comp_tris,
+                    'n_tris': len(comp_tris),
+                    'n_brep': n_brep,
+                    'brep_fids': bf,
+                    'cohesion': coh,
+                    'visible': True,
+                })
+        else:
+            # No face_map: single sub = the whole cluster
+            coh, n_brep, bf = _compute_sub_cohesion(
+                tri_indices, point_feat_normed, face_map)
+            subs.append({
+                'tri_indices': tri_indices,
+                'n_tris': len(tri_indices),
+                'n_brep': n_brep,
+                'brep_fids': bf,
+                'cohesion': coh,
+                'visible': True,
+            })
+
+        subs.sort(key=lambda s: s['cohesion'], reverse=True)
+
+        groups.append({
+            'cluster_id': cid,
+            'n_tris': len(tri_indices),
+            'n_brep': cluster_n_brep,
+            'cohesion': cluster_coh,
+            'subs': subs,
+            'visible': True,
+        })
+
+    groups.sort(key=lambda g: g['cohesion'], reverse=True)
+
+    m['cluster_groups'] = groups
+    n_subs = sum(len(g['subs']) for g in groups)
+    print(f"{n_clusters} clusters -> {n_subs} sub-features (B-Rep connectivity)")
+
+    _update_cluster_colors(m)
+
+
+def _update_cluster_colors(m):
+    """Rebuild per-triangle colors based on group/sub visibility. One color per cluster."""
+    groups = m['cluster_groups']
+    n_tris = len(m['cluster_labels'])
+
+    colors = np.tile(DIMMED_COLOR, (n_tris, 1))
+
+    for gi, g in enumerate(groups):
+        color = CLUSTER_COLORS[gi % len(CLUSTER_COLORS)]
+        for sub in g['subs']:
+            if g['visible'] and sub['visible']:
+                colors[sub['tri_indices']] = color
+
+    m['ps_mesh'].add_color_quantity("cluster_colors", colors,
+                                    defined_on=m["viz_mode"], enabled=True)
+
+
 def ps_callback(opts):
     m = opts.m
 
@@ -695,8 +904,10 @@ def ps_callback(opts):
                                         n_clusters=num_clusters,
                                         ).fit(point_feat)
 
-            m['ps_mesh'].add_scalar_quantity("cluster", clustering.labels_, cmap='turbo', vminmax=(0, num_clusters-1), enabled=True, defined_on=m["viz_mode"])
-            print("Recomputed.")      
+            m['cluster_labels'] = clustering.labels_
+            m['cluster_method'] = f"agglomerative_n{num_clusters}_{opts.adj_mode}"
+            _on_cluster_computed(m, point_feat)
+            print("Recomputed.")
 
 
     elif opts.mode == "cluster_kmeans":
@@ -714,7 +925,144 @@ def ps_callback(opts):
             point_feat = point_feat / np.linalg.norm(point_feat, axis=-1, keepdims=True)
             clustering = KMeans(n_clusters=num_clusters, random_state=0, n_init="auto").fit(point_feat)
 
-            m['ps_mesh'].add_scalar_quantity("cluster", clustering.labels_, cmap='turbo', vminmax=(0, num_clusters-1), enabled=True, defined_on=m["viz_mode"])
+            m['cluster_labels'] = clustering.labels_
+            m['cluster_method'] = f"kmeans_n{num_clusters}"
+            _on_cluster_computed(m, point_feat)
+
+    # --- Cluster browser & save (available after any clustering) ---
+    if 'cluster_groups' in m:
+        psim.Separator()
+
+        groups = m['cluster_groups']
+        n_groups = len(groups)
+        n_subs = sum(len(g['subs']) for g in groups)
+
+        psim.TextUnformatted(f"{n_groups} clusters -> {n_subs} features    {m.get('cluster_method', '?')}")
+
+        # Show All / Show None
+        if psim.Button("Show All"):
+            for g in groups:
+                g['visible'] = True
+                for s in g['subs']:
+                    s['visible'] = True
+            _update_cluster_colors(m)
+        psim.SameLine()
+        if psim.Button("Show None"):
+            for g in groups:
+                g['visible'] = False
+                for s in g['subs']:
+                    s['visible'] = False
+            _update_cluster_colors(m)
+
+        psim.TextUnformatted("(ranked by cohesion, expand to see sub-features)")
+        psim.Separator()
+
+        # Hierarchical tree: groups -> sub-features
+        for gi, g in enumerate(groups):
+            n_sub = len(g['subs'])
+            brep_str = f"  {g['n_brep']} faces" if g['n_brep'] > 0 else ""
+            parts_str = f"  [{n_sub} parts]" if n_sub > 1 else ""
+
+            # Group-level checkbox + tree node
+            toggled, new_val = psim.Checkbox(
+                f"##grp_{gi}", g['visible'])
+            if toggled:
+                g['visible'] = new_val
+                for s in g['subs']:
+                    s['visible'] = new_val
+                _update_cluster_colors(m)
+
+            psim.SameLine()
+            node_label = (f"Cluster {gi}  ({g['n_tris']} tri{brep_str})  "
+                          f"coh={g['cohesion']:.3f}{parts_str}")
+            node_open = psim.TreeNode(node_label)
+
+            # Cohesion bar on same line as tree node header
+            # (can't SameLine with TreeNode easily, so put it inside)
+
+            if node_open:
+                # Sub-features inside this cluster
+                color = CLUSTER_COLORS[gi % len(CLUSTER_COLORS)]
+                for si, sub in enumerate(g['subs']):
+                    psim.PushStyleColor(0, (color[0], color[1], color[2], 1.0))
+
+                    sub_brep = f"  {sub['n_brep']} faces" if sub['n_brep'] > 0 else ""
+                    sub_label = (f"  Part {si}  ({sub['n_tris']} tri{sub_brep})  "
+                                 f"coh={sub['cohesion']:.3f}##sub_{gi}_{si}")
+
+                    sub_toggled, sub_new = psim.Checkbox(sub_label, sub['visible'])
+                    psim.PopStyleColor()
+
+                    if sub_toggled:
+                        sub['visible'] = sub_new
+                        # Update group visibility: on if any sub is on
+                        g['visible'] = any(s['visible'] for s in g['subs'])
+                        _update_cluster_colors(m)
+
+                    psim.SameLine()
+                    psim.ProgressBar(sub['cohesion'], (60, 0))
+
+                    # Tooltip with face IDs
+                    if sub.get('brep_fids') and psim.IsItemHovered():
+                        psim.BeginTooltip()
+                        fids_str = str(sub['brep_fids'][:20])
+                        if len(sub['brep_fids']) > 20:
+                            fids_str = fids_str[:-1] + f", ...+{len(sub['brep_fids'])-20}]"
+                        psim.TextUnformatted(f"B-Rep face IDs: {fids_str}")
+                        psim.EndTooltip()
+
+                psim.TreePop()
+
+        psim.Separator()
+        if psim.Button("Save Clustering Results"):
+            save_clustering_results(opts, m)
+
+
+def save_clustering_results(opts, m):
+    """Save current clustering as hierarchical JSON with clusters and sub-features."""
+    import json
+
+    groups = m['cluster_groups']
+    method = m.get('cluster_method', 'unknown')
+
+    clusters_out = []
+    for gi, g in enumerate(groups):
+        subs_out = []
+        for si, sub in enumerate(g['subs']):
+            subs_out.append({
+                "part_idx": si,
+                "cohesion": round(sub['cohesion'], 4),
+                "n_triangles": sub['n_tris'],
+                "face_ids": sub.get('brep_fids', []),
+                "n_faces": sub['n_brep'],
+            })
+
+        clusters_out.append({
+            "cluster_idx": gi,
+            "cohesion": round(g['cohesion'], 4),
+            "n_triangles": g['n_tris'],
+            "n_faces": g['n_brep'],
+            "sub_features": subs_out,
+        })
+
+    result = {
+        "part_id": opts.filename,
+        "method": method,
+        "n_clusters": len(clusters_out),
+        "n_sub_features": sum(len(c['sub_features']) for c in clusters_out),
+        "clusters": clusters_out,
+    }
+
+    out_path = os.path.join(opts.output_fol, f"{opts.filename}_partfield_{method}.json")
+    with open(out_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"\nSaved to: {out_path}")
+    print(f"  {len(clusters_out)} clusters, {result['n_sub_features']} sub-features")
+    for c in clusters_out:
+        n_parts = len(c['sub_features'])
+        parts_str = f" ({n_parts} parts)" if n_parts > 1 else ""
+        print(f"  Cluster {c['cluster_idx']}: coh={c['cohesion']:.3f}  {c['n_faces']} faces{parts_str}")
+
 
 def main():
     ## Parse args
@@ -722,8 +1070,13 @@ def main():
     parser = ArgumentParser()
     parser.add_arguments(Options, dest="options")
     parser.add_argument('--data_root', default="../exp_results/partfield_features/trellis/", help='Path the model features are stored.')
+    parser.add_argument('--face_map', default=None, help='Path to face_map.npy for B-Rep face ID mapping.')
+    parser.add_argument('--save_dir', default=None, help='Directory to save clustering results (overrides output_fol).')
     args = parser.parse_args()
     opts: Options = args.options
+
+    if args.save_dir:
+        opts.output_fol = args.save_dir
 
     DATA_ROOT = args.data_root
 
@@ -737,8 +1090,14 @@ def main():
         mesh_fname1 = os.path.join(DATA_ROOT, "feat_pca_"+ shape_1 + "_0.ply")
 
     #### To save output ####
-    os.makedirs(opts.output_fol, exist_ok=True)      
+    os.makedirs(opts.output_fol, exist_ok=True)
     ########################
+
+    # Load face_map if provided (maps triangle index -> B-Rep face ID)
+    face_map = None
+    if args.face_map and os.path.exists(args.face_map):
+        face_map = np.load(args.face_map)
+        print(f"Loaded face_map: {face_map.shape} ({len(np.unique(face_map))} B-Rep faces)")
 
     # Initialize
     ps.init()
@@ -746,6 +1105,8 @@ def main():
     mesh_dict = load_features(feature_fname1, mesh_fname1, opts.viz_mode)
     prep_feature_mesh(mesh_dict)
     mesh_dict["viz_mode"] = opts.viz_mode
+    if face_map is not None:
+        mesh_dict["face_map"] = face_map
     opts.m = mesh_dict
 
     # Start the interactive UI

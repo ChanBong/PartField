@@ -210,10 +210,10 @@ def ps_callback(opts):
         _, opts.feature_range = psim.SliderFloat('range', opts.feature_range, v_min=0., v_max=1.0, power=3)
         _, opts.continuous_explore = psim.Checkbox('continuous', opts.continuous_explore)
 
-        # TODO nsharp remember how the keycodes work
-        if io.KeysDown[ord('q')]:
+        # Keyboard shortcuts for adjusting feature range
+        if psim.IsKeyDown(psim.ImGuiKey_Q):
             opts.feature_range += 0.01
-        if io.KeysDown[ord('w')]:
+        if psim.IsKeyDown(psim.ImGuiKey_W):
             opts.feature_range -= 0.01
     
 

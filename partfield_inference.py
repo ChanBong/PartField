@@ -30,7 +30,7 @@ def predict(cfg):
     trainer = Trainer(devices=-1,
                       accelerator="gpu",
                       precision="16-mixed",
-                      strategy=DDPStrategy(find_unused_parameters=True),
+                      strategy="auto",
                       max_epochs=cfg.training_epochs,
                       log_every_n_steps=1,
                       limit_train_batches=3500,
