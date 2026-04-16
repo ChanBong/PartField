@@ -26,3 +26,5 @@ applications/imgui.ini
 # OS
 .DS_Store
 Thumbs.db
+.polyscope.ini
+imgui.ini

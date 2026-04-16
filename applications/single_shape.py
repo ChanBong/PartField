@@ -1014,12 +1014,15 @@ def ps_callback(opts):
                 psim.TreePop()
 
         psim.Separator()
-        if psim.Button("Save Clustering Results"):
-            save_clustering_results(opts, m)
+        if psim.Button("Save All Clusters"):
+            save_clustering_results(opts, m, selected_only=False)
+        psim.SameLine()
+        if psim.Button("Save Selected Only"):
+            save_clustering_results(opts, m, selected_only=True)
 
 
-def save_clustering_results(opts, m):
-    """Save current clustering as hierarchical JSON with clusters and sub-features."""
+def save_clustering_results(opts, m, selected_only=False):
+    """Save clustering as hierarchical JSON. If selected_only, save only visible clusters/subs."""
     import json
 
     groups = m['cluster_groups']
@@ -1027,15 +1030,23 @@ def save_clustering_results(opts, m):
 
     clusters_out = []
     for gi, g in enumerate(groups):
+        if selected_only and not g['visible']:
+            continue
+
         subs_out = []
         for si, sub in enumerate(g['subs']):
+            if selected_only and not sub['visible']:
+                continue
             subs_out.append({
                 "part_idx": si,
                 "cohesion": round(sub['cohesion'], 4),
                 "n_triangles": sub['n_tris'],
-                "face_ids": sub.get('brep_fids', []),
+                "face_ids": [fid + 1 for fid in sub.get('brep_fids', [])],
                 "n_faces": sub['n_brep'],
             })
+
+        if not subs_out:
+            continue
 
         clusters_out.append({
             "cluster_idx": gi,
@@ -1045,18 +1056,22 @@ def save_clustering_results(opts, m):
             "sub_features": subs_out,
         })
 
+    suffix = "_selected" if selected_only else ""
     result = {
+        "indexing": 1,
         "part_id": opts.filename,
         "method": method,
+        "selected_only": selected_only,
         "n_clusters": len(clusters_out),
         "n_sub_features": sum(len(c['sub_features']) for c in clusters_out),
         "clusters": clusters_out,
     }
 
-    out_path = os.path.join(opts.output_fol, f"{opts.filename}_partfield_{method}.json")
+    out_path = os.path.join(opts.output_fol, f"{opts.filename}_partfield_{method}{suffix}.json")
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2)
-    print(f"\nSaved to: {out_path}")
+    tag = "selected" if selected_only else "all"
+    print(f"\nSaved ({tag}) to: {out_path}")
     print(f"  {len(clusters_out)} clusters, {result['n_sub_features']} sub-features")
     for c in clusters_out:
         n_parts = len(c['sub_features'])
