@@ -832,6 +832,101 @@ def _on_cluster_computed(m, point_feat_normed):
     _update_cluster_colors(m)
 
 
+# Fixed per-type colors so Hole is always red, Shaft always blue, etc.
+UNIT_FEATURE_COLORS = {
+    "Hole":               np.array([0.90, 0.20, 0.20], dtype=np.float32),
+    "Shaft":              np.array([0.20, 0.60, 0.90], dtype=np.float32),
+    "Fillet":             np.array([0.20, 0.80, 0.30], dtype=np.float32),
+    "Chamfer":            np.array([0.10, 0.80, 0.80], dtype=np.float32),
+    "BossExtrudeFeature": np.array([0.95, 0.60, 0.10], dtype=np.float32),
+    "CutExtrudeFeature":  np.array([0.70, 0.30, 0.85], dtype=np.float32),
+    "PrismaticMilling":   np.array([0.95, 0.85, 0.10], dtype=np.float32),
+    "Thread":             np.array([0.55, 0.35, 0.15], dtype=np.float32),
+    "Bases":              np.array([0.75, 0.75, 0.20], dtype=np.float32),
+}
+UNIT_FEATURE_FALLBACK = np.array([
+    [0.40, 0.75, 0.55], [0.85, 0.50, 0.25], [0.50, 0.50, 0.90],
+    [0.90, 0.40, 0.70], [0.30, 0.50, 0.70], [0.80, 0.65, 0.40],
+    [0.55, 0.80, 0.80], [0.75, 0.40, 0.55], [0.45, 0.70, 0.30],
+], dtype=np.float32)
+UNRECOGNIZED_COLOR = np.array([0.45, 0.45, 0.45], dtype=np.float32)
+
+
+def _unit_feature_color(name: str) -> np.ndarray:
+    if name in UNIT_FEATURE_COLORS:
+        return UNIT_FEATURE_COLORS[name]
+    idx = abs(hash(name)) % len(UNIT_FEATURE_FALLBACK)
+    return UNIT_FEATURE_FALLBACK[idx]
+
+
+def load_hrep_features(hrep_path: str):
+    """Load HRep JSON, return list of {name, face_ids (0-indexed set)}."""
+    import json
+    with open(hrep_path) as f:
+        data = json.load(f)
+    features = []
+    for feat in data.get("features", []):
+        name = feat.get("feature_name")
+        if not name:
+            continue
+        fids = {fid - 1 for fid in feat.get("face_groups", []) if fid}
+        if not fids:
+            continue
+        features.append({"name": name, "face_ids": fids})
+    return features
+
+
+def _break_sub(sub, hrep_features, face_map):
+    """Split a sub-cluster's B-Rep faces into unit features from HRep.
+
+    Writes sub['broken'] = True, sub['unit_features'] = [...],
+    sub['unrecognized'] = {...} | None. Triangle masks are restricted to
+    tris belonging to this sub so other subs are unaffected.
+    """
+    sub_tris = sub['tri_indices']
+    sub_fids = set(sub.get('brep_fids', []))
+    if not sub_fids or face_map is None:
+        sub['broken'] = True
+        sub['unit_features'] = []
+        sub['unrecognized'] = None
+        return
+
+    sub_tri_face_ids = face_map[sub_tris]
+
+    covered = set()
+    unit_features = []
+    for feat in hrep_features:
+        overlap = feat['face_ids'] & sub_fids
+        if not overlap:
+            continue
+        mask = np.isin(sub_tri_face_ids, list(overlap))
+        unit_features.append({
+            'name': feat['name'],
+            'color': _unit_feature_color(feat['name']),
+            'brep_fids': sorted(overlap),
+            'tri_indices': sub_tris[mask],
+            'visible': True,
+        })
+        covered.update(overlap)
+
+    # Sort for stable display: by type name, then face count desc
+    unit_features.sort(key=lambda u: (u['name'], -len(u['brep_fids'])))
+
+    unrecognized = None
+    unrec_fids = sub_fids - covered
+    if unrec_fids:
+        mask = np.isin(sub_tri_face_ids, list(unrec_fids))
+        unrecognized = {
+            'brep_fids': sorted(unrec_fids),
+            'tri_indices': sub_tris[mask],
+            'visible': True,
+        }
+
+    sub['broken'] = True
+    sub['unit_features'] = unit_features
+    sub['unrecognized'] = unrecognized
+
+
 def _update_cluster_colors(m):
     """Rebuild per-triangle colors based on group/sub visibility. One color per cluster."""
     groups = m['cluster_groups']
@@ -840,10 +935,21 @@ def _update_cluster_colors(m):
     colors = np.tile(DIMMED_COLOR, (n_tris, 1))
 
     for gi, g in enumerate(groups):
-        color = CLUSTER_COLORS[gi % len(CLUSTER_COLORS)]
+        if not g['visible']:
+            continue
+        cluster_color = CLUSTER_COLORS[gi % len(CLUSTER_COLORS)]
         for sub in g['subs']:
-            if g['visible'] and sub['visible']:
-                colors[sub['tri_indices']] = color
+            if not sub['visible']:
+                continue
+            if sub.get('broken'):
+                for uf in sub.get('unit_features', []):
+                    if uf['visible']:
+                        colors[uf['tri_indices']] = uf['color']
+                unr = sub.get('unrecognized')
+                if unr and unr['visible']:
+                    colors[unr['tri_indices']] = UNRECOGNIZED_COLOR
+            else:
+                colors[sub['tri_indices']] = cluster_color
 
     m['ps_mesh'].add_color_quantity("cluster_colors", colors,
                                     defined_on=m["viz_mode"], enabled=True)
@@ -983,6 +1089,10 @@ def ps_callback(opts):
             if node_open:
                 # Sub-features inside this cluster
                 color = CLUSTER_COLORS[gi % len(CLUSTER_COLORS)]
+                hrep_feats = m.get('hrep_features')
+                face_map = m.get('face_map')
+                can_break = hrep_feats is not None and face_map is not None
+
                 for si, sub in enumerate(g['subs']):
                     psim.PushStyleColor(0, (color[0], color[1], color[2], 1.0))
 
@@ -999,10 +1109,7 @@ def ps_callback(opts):
                         g['visible'] = any(s['visible'] for s in g['subs'])
                         _update_cluster_colors(m)
 
-                    psim.SameLine()
-                    psim.ProgressBar(sub['cohesion'], (60, 0))
-
-                    # Tooltip with face IDs
+                    # Hover tooltip on the checkbox row: cluster's face IDs
                     if sub.get('brep_fids') and psim.IsItemHovered():
                         psim.BeginTooltip()
                         fids_str = str(sub['brep_fids'][:20])
@@ -1010,6 +1117,70 @@ def ps_callback(opts):
                             fids_str = fids_str[:-1] + f", ...+{len(sub['brep_fids'])-20}]"
                         psim.TextUnformatted(f"B-Rep face IDs: {fids_str}")
                         psim.EndTooltip()
+
+                    psim.SameLine()
+                    psim.ProgressBar(sub['cohesion'], (60, 0))
+
+                    # Break / Restore button (needs HRep JSON + face_map)
+                    if can_break and sub['n_brep'] > 0:
+                        psim.SameLine()
+                        is_broken = sub.get('broken', False)
+                        btn_label = (f"Restore##br_{gi}_{si}" if is_broken
+                                     else f"Break##br_{gi}_{si}")
+                        if psim.SmallButton(btn_label):
+                            if is_broken:
+                                sub['broken'] = False
+                                sub.pop('unit_features', None)
+                                sub.pop('unrecognized', None)
+                            else:
+                                _break_sub(sub, hrep_feats, face_map)
+                            _update_cluster_colors(m)
+
+                    # Broken mode: show unit features + unrecognized as children
+                    if sub.get('broken'):
+                        ufs = sub.get('unit_features', [])
+                        for ui, uf in enumerate(ufs):
+                            col = uf['color']
+                            psim.PushStyleColor(0, (col[0], col[1], col[2], 1.0))
+                            n_f = len(uf['brep_fids'])
+                            uf_label = (f"      {uf['name']}  ({n_f} faces)"
+                                        f"##uf_{gi}_{si}_{ui}")
+                            uf_tog, uf_new = psim.Checkbox(uf_label, uf['visible'])
+                            psim.PopStyleColor()
+                            if uf_tog:
+                                uf['visible'] = uf_new
+                                _update_cluster_colors(m)
+                            if psim.IsItemHovered():
+                                psim.BeginTooltip()
+                                fids_str = str(uf['brep_fids'][:20])
+                                if n_f > 20:
+                                    fids_str = fids_str[:-1] + f", ...+{n_f-20}]"
+                                psim.TextUnformatted(f"B-Rep face IDs: {fids_str}")
+                                psim.EndTooltip()
+
+                        unr = sub.get('unrecognized')
+                        if unr:
+                            col = UNRECOGNIZED_COLOR
+                            psim.PushStyleColor(0, (col[0], col[1], col[2], 1.0))
+                            n_u = len(unr['brep_fids'])
+                            unr_label = (f"      Unrecognized  ({n_u} faces)"
+                                         f"##unr_{gi}_{si}")
+                            ut, un = psim.Checkbox(unr_label, unr['visible'])
+                            psim.PopStyleColor()
+                            if ut:
+                                unr['visible'] = un
+                                _update_cluster_colors(m)
+                            if psim.IsItemHovered():
+                                psim.BeginTooltip()
+                                fids_str = str(unr['brep_fids'][:20])
+                                if n_u > 20:
+                                    fids_str = fids_str[:-1] + f", ...+{n_u-20}]"
+                                psim.TextUnformatted(f"B-Rep face IDs: {fids_str}")
+                                psim.EndTooltip()
+                        elif ufs:
+                            psim.TextUnformatted("      (all faces recognized)")
+                        else:
+                            psim.TextUnformatted("      (no HRep matches)")
 
                 psim.TreePop()
 
@@ -1087,6 +1258,7 @@ def main():
     parser.add_argument('--data_root', default="../exp_results/partfield_features/trellis/", help='Path the model features are stored.')
     parser.add_argument('--face_map', default=None, help='Path to face_map.npy for B-Rep face ID mapping.')
     parser.add_argument('--save_dir', default=None, help='Directory to save clustering results (overrides output_fol).')
+    parser.add_argument('--hrep_json', default=None, help='Path to <part_id>_hrep.json. Enables per-sub "Break into unit features".')
     args = parser.parse_args()
     opts: Options = args.options
 
@@ -1122,6 +1294,13 @@ def main():
     mesh_dict["viz_mode"] = opts.viz_mode
     if face_map is not None:
         mesh_dict["face_map"] = face_map
+
+    # Load HRep features if provided: enables per-sub "Break into unit features"
+    if args.hrep_json and os.path.exists(args.hrep_json):
+        hrep_features = load_hrep_features(args.hrep_json)
+        mesh_dict["hrep_features"] = hrep_features
+        print(f"Loaded HRep: {len(hrep_features)} features from {args.hrep_json}")
+
     opts.m = mesh_dict
 
     # Start the interactive UI
