@@ -849,7 +849,7 @@ UNIT_FEATURE_FALLBACK = np.array([
     [0.90, 0.40, 0.70], [0.30, 0.50, 0.70], [0.80, 0.65, 0.40],
     [0.55, 0.80, 0.80], [0.75, 0.40, 0.55], [0.45, 0.70, 0.30],
 ], dtype=np.float32)
-UNRECOGNIZED_COLOR = np.array([0.45, 0.45, 0.45], dtype=np.float32)
+UNRECOGNIZED_COLOR = np.array([1.00, 0.05, 0.25], dtype=np.float32)
 
 
 def _unit_feature_color(name: str) -> np.ndarray:
@@ -1045,7 +1045,7 @@ def ps_callback(opts):
 
         psim.TextUnformatted(f"{n_groups} clusters -> {n_subs} features    {m.get('cluster_method', '?')}")
 
-        # Show All / Show None
+        # Show All / Show None / Break All / Restore All
         if psim.Button("Show All"):
             for g in groups:
                 g['visible'] = True
@@ -1059,6 +1059,48 @@ def ps_callback(opts):
                 for s in g['subs']:
                     s['visible'] = False
             _update_cluster_colors(m)
+
+        hrep_feats = m.get('hrep_features')
+        face_map = m.get('face_map')
+        if hrep_feats is not None and face_map is not None:
+            psim.SameLine()
+            if psim.Button("Break All"):
+                for g in groups:
+                    g['visible'] = True
+                    for s in g['subs']:
+                        s['visible'] = True
+                        if not s.get('broken') and s['n_brep'] > 0:
+                            _break_sub(s, hrep_feats, face_map)
+                m['expand_all'] = True
+                _update_cluster_colors(m)
+            psim.SameLine()
+            if psim.Button("Restore All"):
+                for g in groups:
+                    for s in g['subs']:
+                        s['broken'] = False
+                        s.pop('unit_features', None)
+                        s.pop('unrecognized', None)
+                _update_cluster_colors(m)
+
+            any_broken = any(s.get('broken') for g in groups for s in g['subs'])
+            if any_broken:
+                psim.SameLine()
+                if psim.Button("Show Unrecognized"):
+                    m['expand_all'] = True
+                    m['collapse_recognized'] = True
+                    for g in groups:
+                        has_unrec = False
+                        for s in g['subs']:
+                            if s.get('broken') and s.get('unrecognized'):
+                                has_unrec = True
+                                s['visible'] = True
+                                for uf in s.get('unit_features', []):
+                                    uf['visible'] = False
+                                s['unrecognized']['visible'] = True
+                            else:
+                                s['visible'] = False
+                        g['visible'] = has_unrec
+                    _update_cluster_colors(m)
 
         psim.TextUnformatted("(ranked by cohesion, expand to see sub-features)")
         psim.Separator()
@@ -1081,6 +1123,13 @@ def ps_callback(opts):
             psim.SameLine()
             node_label = (f"Cluster {gi}  ({g['n_tris']} tri{brep_str})  "
                           f"coh={g['cohesion']:.3f}{parts_str}")
+            if m.get('collapse_recognized'):
+                has_unrec = any(
+                    s.get('broken') and s.get('unrecognized')
+                    for s in g['subs'])
+                psim.SetNextItemOpen(has_unrec)
+            elif m.get('expand_all'):
+                psim.SetNextItemOpen(True)
             node_open = psim.TreeNode(node_label)
 
             # Cohesion bar on same line as tree node header
@@ -1183,6 +1232,9 @@ def ps_callback(opts):
                             psim.TextUnformatted("      (no HRep matches)")
 
                 psim.TreePop()
+
+        m.pop('expand_all', None)
+        m.pop('collapse_recognized', None)
 
         psim.Separator()
         if psim.Button("Save All Clusters"):
